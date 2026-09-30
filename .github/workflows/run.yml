@@ -1,0 +1,123 @@
+name: Traffic optimization demo
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Install dependencies
+        run: pip install numpy pandas scikit-learn pyspark
+      - name: Write program
+        run: |
+          cat > traffic_demo.py << 'PYEOF'
+          """
+          Real-Time Traffic Optimization - runnable demo (simulated data).
+
+          1. Simulates IoT sensor events (vehicle counts / speeds per road segment).
+          2. Aggregates them into 1-minute windows (PySpark if available, else pandas).
+          3. Trains a model to forecast average speed 5 minutes ahead.
+          4. Reports MAE/RMSE vs a naive baseline and saves results.
+
+          NOTE: all numbers come from synthetic data. Results are for demonstration only.
+          """
+          import json
+          import numpy as np
+          import pandas as pd
+          from sklearn.ensemble import GradientBoostingRegressor
+          from sklearn.metrics import mean_absolute_error, mean_squared_error
+
+          RNG = np.random.default_rng(42)
+          SEGMENTS, MINUTES, HORIZON = 20, 24 * 60, 5
+
+
+          def simulate_events():
+              """Simulate per-minute sensor readings with rush-hour congestion."""
+              rows = []
+              t = np.arange(MINUTES)
+              for seg in range(SEGMENTS):
+                  rush = np.exp(-((t - 8.5 * 60) ** 2) / (2 * 60**2)) + np.exp(-((t - 18 * 60) ** 2) / (2 * 75**2))
+                  volume = 40 + 120 * rush * RNG.uniform(0.7, 1.3) + RNG.normal(0, 5, MINUTES)
+                  speed = np.clip(60 - 0.28 * volume + RNG.normal(0, 2, MINUTES), 5, 60)
+                  rows.append(pd.DataFrame({"segment": seg, "minute": t, "volume": volume, "speed": speed}))
+              return pd.concat(rows, ignore_index=True)
+
+
+          def aggregate(df):
+              try:
+                  from pyspark.sql import SparkSession, functions as F
+                  spark = SparkSession.builder.master("local[2]").appName("traffic").getOrCreate()
+                  spark.sparkContext.setLogLevel("ERROR")
+                  out = (spark.createDataFrame(df)
+                         .groupBy("segment", "minute")
+                         .agg(F.avg("volume").alias("volume"), F.avg("speed").alias("speed"))
+                         .orderBy("segment", "minute").toPandas())
+                  spark.stop()
+                  print("Aggregation: PySpark")
+                  return out
+              except Exception as e:
+                  print(f"Aggregation: pandas (PySpark unavailable: {type(e).__name__})")
+                  return df.groupby(["segment", "minute"], as_index=False).mean()
+
+
+          def make_features(df):
+              df = df.sort_values(["segment", "minute"]).copy()
+              g = df.groupby("segment")
+              for lag in (1, 2, 3, 5, 10):
+                  df[f"speed_lag{lag}"] = g["speed"].shift(lag)
+                  df[f"vol_lag{lag}"] = g["volume"].shift(lag)
+              df["hour_sin"] = np.sin(2 * np.pi * df["minute"] / 1440)
+              df["hour_cos"] = np.cos(2 * np.pi * df["minute"] / 1440)
+              df["target"] = g["speed"].shift(-HORIZON)
+              return df.dropna()
+
+
+          def main():
+              df = make_features(aggregate(simulate_events()))
+              split = int(MINUTES * 0.75)
+              train, test = df[df.minute < split], df[df.minute >= split]
+              feats = [c for c in df.columns if c not in ("segment", "minute", "target", "speed", "volume")] + ["speed", "volume"]
+
+              model = GradientBoostingRegressor(n_estimators=150, max_depth=3, random_state=0)
+              model.fit(train[feats], train["target"])
+              pred = model.predict(test[feats])
+              naive = test["speed"]  # baseline: speed stays the same
+
+              rmse = lambda a, b: float(np.sqrt(mean_squared_error(a, b)))
+              result = {
+                  "horizon_minutes": HORIZON,
+                  "model_mae": round(float(mean_absolute_error(test["target"], pred)), 3),
+                  "model_rmse": round(rmse(test["target"], pred), 3),
+                  "baseline_mae": round(float(mean_absolute_error(test["target"], naive)), 3),
+                  "baseline_rmse": round(rmse(test["target"], naive), 3),
+                  "data": "synthetic",
+              }
+              print(json.dumps(result, indent=2))
+              with open("results.json", "w") as f:
+                  json.dump(result, f, indent=2)
+
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+      - name: Run program
+        run: python traffic_demo.py
+      - name: Show results
+        run: |
+          echo "### Traffic forecast results (synthetic data)" >> $GITHUB_STEP_SUMMARY
+          echo '```json' >> $GITHUB_STEP_SUMMARY
+          cat results.json >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: results
+          path: results.json
